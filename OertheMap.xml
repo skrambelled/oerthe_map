@@ -1,0 +1,1338 @@
+<muclient>
+<plugin
+   name="OertheMap"
+   author="Mark"
+   id="15b4c6e2b60d4d2ea7083514"
+   language="Lua"
+   purpose="Live-updating map of Oerthe for Ancient Anguish"
+   date_written="2026-09-11"
+   requires="4.90"
+   version="1.0"
+>
+</plugin>
+
+<!--
+  Requires the 'mush_windows' plugin (shared window chrome) to be
+  installed too — see its README.md. Without it, the map window itself
+  won't appear, but position tracking and text commands (map_legend,
+  etc.) still work.
+
+  Setup, once per character:
+    1. Make sure your prompt includes |XCOORD| and |YCOORD| somewhere
+       (e.g. "prompt set |HP|:|SP|>|NEWLINE|X:[|XCOORD|]Y:[|YCOORD|]").
+    2. Type: map_setup
+       This sends "prompt settings" to the game, reads back your prompt
+       template, and derives a regex to track your position from it.
+       Only needs to be redone if you change your prompt with `prompt set`.
+
+  Ongoing use:
+    - Whenever you `read map` in-game (or run `map_refresh`), the plugin
+      learns the symbols in that block and merges them into its local
+      data, overriding the bundled seed data for those cells.
+    - map_legend: print the terrain colour legend
+    - map_show / map_hide: toggle the map panel
+    - map_debug: dump the last parsed read-map block for sanity-checking
+    - map_setcmd (text): change the in-game command sent by map_refresh
+      (default "read map")
+    - map_import_seed (path): (re)builds seed_data.lua from a saved local
+      copy of either https://anguish.org/gameplay/mapoerthe.html, or a
+      skrambelled/aa-map html/map.html export (auto-detected by looking
+      for that page's own <table id='map'>); everything runs in Lua
+      inside this plugin, no external tools needed beyond however you
+      saved the page itself (e.g. curl to a local file). Only the
+      aa-map export carries ocean depth; named-location titles only
+      come from the old anguish.org page, though a title survives a
+      re-import from either as long as the terrain at its coordinate
+      hasn't changed.
+    - map_hide_coords / map_show_coords: hide (or restore) the whole
+      prompt line containing your coordinates from your visible output,
+      now that the map panel shows your position. Position tracking keeps
+      working either way; this only affects what you see.
+    - Zoom: +/- buttons top-right of the map, or scroll the mouse wheel
+      over it (map_zoom_in / map_zoom_out also work without a mouse).
+    - Pan: left-click and drag the map. This unlocks it from your
+      position (see SNAP below).
+    - map_snap (or the SNAP button): toggles whether the map re-centers
+      on your current location as you move. Starts on; panning turns it
+      off automatically, click/type it again to re-lock.
+    - The DEPTH button: toggles colouring "=" (sea) tiles by ocean depth
+      (needs depth data, only present after importing from a
+      skrambelled/aa-map export) instead of the flat legend sea colour.
+      Off by default, persisted once you turn it on.
+-->
+
+<triggers>
+  <trigger
+     name="oerthe_prompt_header"
+     match="^Your prompt:$"
+     enabled="y"
+     regexp="y"
+     sequence="100"
+     script="StartPromptCapture"
+  ></trigger>
+
+  <trigger
+     name="oerthe_map_border"
+     match="^\+-+\+$"
+     enabled="y"
+     regexp="y"
+     sequence="100"
+     script="OnMapBorderLine"
+  ></trigger>
+</triggers>
+
+<aliases>
+  <alias name="oerthe_setup" match="^map_setup$" enabled="y" regexp="y" sequence="100" script="MapSetup"></alias>
+  <alias name="oerthe_refresh" match="^map_refresh$" enabled="y" regexp="y" sequence="100" script="MapRefresh"></alias>
+  <alias name="oerthe_legend" match="^map_legend$" enabled="y" regexp="y" sequence="100" script="MapLegend"></alias>
+  <alias name="oerthe_debug" match="^map_debug$" enabled="y" regexp="y" sequence="100" script="MapDebug"></alias>
+  <alias name="oerthe_show" match="^map_show$" enabled="y" regexp="y" sequence="100" script="MapShow"></alias>
+  <alias name="oerthe_hide" match="^map_hide$" enabled="y" regexp="y" sequence="100" script="MapHide"></alias>
+  <alias name="oerthe_setcmd" match="^map_setcmd (.+)$" enabled="y" regexp="y" sequence="100" script="MapSetCmd"></alias>
+  <alias name="oerthe_import_seed" match="^map_import_seed (.+)$" enabled="y" regexp="y" sequence="100" script="MapImportSeed"></alias>
+  <alias name="oerthe_hide_coords" match="^map_hide_coords$" enabled="y" regexp="y" sequence="100" script="MapHideCoords"></alias>
+  <alias name="oerthe_show_coords" match="^map_show_coords$" enabled="y" regexp="y" sequence="100" script="MapShowCoords"></alias>
+  <alias name="oerthe_zoom_in" match="^map_zoom_in$" enabled="y" regexp="y" sequence="100" script="MapZoomIn"></alias>
+  <alias name="oerthe_zoom_out" match="^map_zoom_out$" enabled="y" regexp="y" sequence="100" script="MapZoomOut"></alias>
+  <alias name="oerthe_snap" match="^map_snap$" enabled="y" regexp="y" sequence="100" script="MapToggleSnap"></alias>
+</aliases>
+
+<script>
+<![CDATA[
+
+-- ===========================================================================
+-- OertheMap: live-updating ASCII map plugin for Ancient Anguish (MUSHclient)
+-- ===========================================================================
+
+local FONT_ID = "oerthe_font"
+local FONT_NAME = "Courier New"
+local FONT_SIZE = 10
+local MARGIN = 4
+local MIN_VIEW = 3
+local VIEW_W = 21   -- cells wide (must be odd so player is dead-center)
+local VIEW_H = 15   -- cells tall (must be odd)
+local HIGHLIGHT_BG = 0x004080   -- BGR: a muted blue highlight behind the player's cell
+local UNKNOWN_TEXT_COLOUR = 0x888888
+local BG_COLOUR = 0x000000
+
+-- Zoom is implemented by changing the grid font's point size (bigger glyphs
+-- = fewer cells fit = zoomed in), rather than sub-cell scaling -- this is an
+-- ASCII/glyph map, so "zoom" only really makes sense at font granularity.
+local ZOOM_SIZES = { 6, 7, 8, 9, 10, 12, 14, 16, 20, 24 }
+local DEFAULT_ZOOM_INDEX = 5   -- ZOOM_SIZES[5] == 10, matches the original fixed FONT_SIZE
+local zoomIndex = DEFAULT_ZOOM_INDEX
+
+local CTRL_FONT_ID = "oerthe_ctrl_font"
+local CTRL_FONT_SIZE = 11
+local CTRL_LINE_H_PX = 14   -- recalculated in InitWindow
+local CTRL_GAP = 4
+local ZOOM_BTN_SIZE = 18
+local SNAP_BTN_W, SNAP_BTN_H = 46, 18
+local DEPTH_BTN_W = 58   -- wider than SNAP_BTN_W: "DEPTH" is a longer label than "SNAP"
+
+-- Keep the pan/zoom hotspot clear of winframe's own resize-edge strips
+-- (its EDGE_PX), so the window can still be resized from its edges.
+local PAN_EDGE_INSET = 6
+
+-- Caps how often a pan drag actually repaints the grid (see
+-- winframe:throttled). Without this, zooming out shrinks CELL_W_PX/
+-- LINE_H_PX, so the same mouse-drag distance crosses more map cells --
+-- each crossing fires a repaint, and each repaint has more visible
+-- cells to draw, so panning while zoomed out was firing a burst of
+-- increasingly expensive full-grid repaints for one drag gesture.
+local PAN_REPAINT_INTERVAL = 1 / 30
+
+-- placeholders, recalculated in InitWindow; SYMBOL_W_PX is the width of the
+-- 2-character glyph itself, CELL_W_PX is the column stride (symbol + a
+-- single-space gap before the next column, matching the in-game 'read map'
+-- layout).
+local CHAR_W_PX, LINE_H_PX, SYMBOL_W_PX, CELL_W_PX = 8, 14, 16, 24
+
+-- Runtime state -------------------------------------------------------------
+
+local player = { x = nil, y = nil }
+
+-- The map's current view center. While snapToLocation is true, the view
+-- always tracks the player (view.x/y are ignored); dragging the map with
+-- the mouse disengages snapToLocation and pans view.x/y independently.
+local view = { x = nil, y = nil }
+local snapToLocation = true
+local panDragState = nil
+
+-- Whether ocean/glacier cells are coloured by depth tier (see
+-- DEPTH_COLOURS below) instead of their flat legend colour. Off by
+-- default so a fresh install looks exactly like before this existed.
+local showDepth = false
+
+local seed_data = { legend = {}, cells = {}, titles = {}, depths = {} }
+local learned_data = { cells = {} }
+local cells = {}          -- merged view: seed overridden by learned
+local legend = {}
+local titles = {}
+local depths = {}         -- "x,y" -> 1..5, only for cells with known ocean depth
+
+local promptCapture = { active = false, lines = {} }
+local mapCapture = { active = false, lines = {} }
+local lastReadMapDebug = nil
+
+local coordLineSpecs = {}     -- triggerName -> { pattern=, xGroup=, yGroup= }
+local currentCoordSpecs = nil -- last-installed specs list, so the hide/show toggle can re-install without resending "prompt settings"
+local readMapCommand = "read map"
+local hideCoordLine = false
+
+-- ---------------------------------------------------------------------------
+-- Small helpers
+-- ---------------------------------------------------------------------------
+
+local function ClientNote(msg)
+  ColourNote("orange", "", "[OertheMap] " .. msg)
+end
+
+local function DirOf(pluginId)
+  local dir = GetPluginInfo(pluginId, 20) or ""
+  if dir ~= "" and dir:sub(-1) ~= "/" and dir:sub(-1) ~= "\\" then
+    dir = dir .. "/"
+  end
+  return dir
+end
+
+local function PluginDir()
+  return DirOf(GetPluginID())
+end
+
+-- winframe.lua (draggable/resizable window chrome) lives in the
+-- mush_windows plugin, not here, so every plugin with a window shares
+-- one copy instead of each bundling its own. Plugins can only find each
+-- other by an ID they both already know (not by searching), so this is
+-- MUSHclient's own sanctioned dependency pattern -- see
+-- mush_windows.xml's header comment, and nickgammon's checkplugin.lua,
+-- for the same shape of check.
+local WINDOWS_PLUGIN_ID = "26a4ca2758d503d86efe902e"
+
+local function EnsureWindowsPlugin()
+  if IsPluginInstalled(WINDOWS_PLUGIN_ID) then
+    if not GetPluginInfo(WINDOWS_PLUGIN_ID, 17) then
+      EnablePlugin(WINDOWS_PLUGIN_ID, true)
+    end
+    if GetPluginInfo(WINDOWS_PLUGIN_ID, 17) then
+      return true
+    end
+    ClientNote("the 'mush_windows' plugin is installed but could not be enabled -- " ..
+      "enable it manually via File -> Plugins, then reload this plugin.")
+    return false
+  end
+
+  -- Convenience for this dev workspace, where mush_windows lives in a
+  -- sibling folder next to this plugin's own: try auto-installing it
+  -- from there. A real end-user install won't necessarily have that
+  -- layout, so this is wrapped defensively -- either way, IsPluginInstalled
+  -- below is checked again rather than assumed to have worked.
+  pcall(function()
+    LoadPlugin(PluginDir() .. "../mush_windows/mush_windows.xml")
+  end)
+
+  if IsPluginInstalled(WINDOWS_PLUGIN_ID) then
+    return true
+  end
+
+  ClientNote("requires the 'mush_windows' plugin (shared window chrome), which isn't installed. " ..
+    "Install mush_windows.xml first (see its README.md), then reload this plugin.")
+  return false
+end
+
+local function LoadLuaFile(path)
+  local chunk, err = loadfile(path)
+  if not chunk then return nil, err end
+  local ok, result = pcall(chunk)
+  if not ok then return nil, result end
+  return result
+end
+
+local function HexToMushColour(hex)
+  if not hex then return UNKNOWN_TEXT_COLOUR end
+  local r = tonumber(hex:sub(2, 3), 16) or 0
+  local g = tonumber(hex:sub(4, 5), 16) or 0
+  local b = tonumber(hex:sub(6, 7), 16) or 0
+  return r + g * 256 + b * 65536
+end
+
+-- Legend colours never change once loaded, but DrawGrid calls into this
+-- for every visible cell on every repaint -- with more cells visible
+-- when zoomed out, that's the hex string parsing above running
+-- thousands of times a second during a pan. Do it once per legend entry
+-- here instead, and have DrawGrid read the cached .rgb field.
+local function PrecomputeLegendColours(tbl)
+  for _, info in pairs(tbl) do
+    info.rgb = HexToMushColour(info.color)
+  end
+end
+
+-- Depth-tier colours, shallow to deep, matching skrambelled/aa-map's own
+-- css/map.css (.depth1..depth5). Only ever applied to "=" (sea) glyphs --
+-- see DrawGrid -- since that's the only symbol whose own legend colour
+-- the source site lets a per-cell depth colour override (other terrain,
+-- e.g. glaciers, keeps its own fixed colour there regardless of the
+-- depth value underneath it).
+local DEPTH_COLOUR_HEX = { "#2146ff", "#0052ce", "#0000b9", "#000086", "#00004a" }
+local DEPTH_COLOURS = {}
+for i, hex in ipairs(DEPTH_COLOUR_HEX) do DEPTH_COLOURS[i] = HexToMushColour(hex) end
+
+local function EscapeRegex(s)
+  return (s:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?{}|\\])", "\\%1"))
+end
+
+-- The point the grid is drawn around: the player's position, unless the
+-- map has been panned away from it (snapToLocation false).
+local function CurrentCenter()
+  if snapToLocation or not view.x then
+    return player.x, player.y
+  end
+  return view.x, view.y
+end
+
+-- ---------------------------------------------------------------------------
+-- Data loading / merging / persistence
+-- ---------------------------------------------------------------------------
+
+function RebuildCells()
+  cells = {}
+  for k, v in pairs(seed_data.cells or {}) do cells[k] = v end
+  for k, v in pairs(learned_data.cells or {}) do cells[k] = v end
+end
+
+local function LoadData()
+  local dir = PluginDir()
+
+  local seed, err = LoadLuaFile(dir .. "seed_data.lua")
+  if seed then
+    seed_data = seed
+  else
+    ClientNote("no seed_data.lua found (" .. tostring(err) ..
+      ") -- run map_import_seed <path to a saved map page>, or just use map_setup + explore to learn the map from scratch.")
+    seed_data = { legend = {}, cells = {}, titles = {}, depths = {} }
+  end
+  legend = seed_data.legend or {}
+  titles = seed_data.titles or {}
+  depths = seed_data.depths or {}
+  PrecomputeLegendColours(legend)
+
+  local learned = LoadLuaFile(dir .. "learned_data.lua")
+  learned_data = learned or { cells = {} }
+  learned_data.cells = learned_data.cells or {}
+
+  RebuildCells()
+end
+
+function SaveLearnedData()
+  local path = PluginDir() .. "learned_data.lua"
+  local f, err = io.open(path, "w")
+  if not f then
+    ClientNote("could not save learned_data.lua: " .. tostring(err))
+    return
+  end
+  f:write("-- Auto-updated by OertheMap from live 'read map' captures. Do not hand-edit.\n")
+  f:write("return {\n  cells = {\n")
+  local keys = {}
+  for k in pairs(learned_data.cells) do keys[#keys + 1] = k end
+  table.sort(keys)
+  for _, k in ipairs(keys) do
+    f:write(string.format("    [%q] = %q,\n", k, learned_data.cells[k]))
+  end
+  f:write("  },\n}\n")
+  f:close()
+end
+
+local function SaveCoordConfig(specs)
+  local path = PluginDir() .. "coord_config.lua"
+  local f, err = io.open(path, "w")
+  if not f then
+    ClientNote("could not save coord_config.lua: " .. tostring(err))
+    return
+  end
+  f:write("-- Auto-generated by map_setup from your 'prompt settings' output.\n")
+  f:write("return {\n")
+  for _, spec in ipairs(specs) do
+    f:write(string.format(
+      "  { pattern = %q, xGroup = %s, yGroup = %s },\n",
+      spec.pattern,
+      spec.xGroup and tostring(spec.xGroup) or "nil",
+      spec.yGroup and tostring(spec.yGroup) or "nil"
+    ))
+  end
+  f:write("}\n")
+  f:close()
+end
+
+local function InstallCoordTriggers(specs)
+  -- Clear any previously installed coordinate triggers first.
+  for name, _ in pairs(coordLineSpecs) do
+    DeleteTrigger(name)
+  end
+  coordLineSpecs = {}
+  currentCoordSpecs = specs
+
+  -- flags: enabled(1) + regexp(32) + replace-if-exists(1024) = 1057,
+  -- plus omit-from-output(4) when the coordinate line should be hidden.
+  local flags = 1057 + (hideCoordLine and 4 or 0)
+
+  for i, spec in ipairs(specs) do
+    local name = "oerthe_coord_" .. i
+    AddTriggerEx(name, spec.pattern, "", flags, -1, 0, "", "OnCoordLineMatch", 0, 100)
+    coordLineSpecs[name] = spec
+  end
+end
+
+function SetHideCoordLine(hide)
+  hideCoordLine = hide
+  SetVariable("hide_coord_line", hide and "1" or "0")
+  if currentCoordSpecs then
+    InstallCoordTriggers(currentCoordSpecs)
+  end
+  ClientNote(hide and "the coordinate line will now be hidden from your output."
+    or "the coordinate line will now be shown again.")
+end
+
+local function LoadCoordConfig()
+  local specs = LoadLuaFile(PluginDir() .. "coord_config.lua")
+  if specs then
+    InstallCoordTriggers(specs)
+    return true
+  end
+  return false
+end
+
+-- ---------------------------------------------------------------------------
+-- Seed data import: parses a locally-saved copy of the static map page
+-- (https://anguish.org/gameplay/mapoerthe.html) into seed_data.lua.
+-- Pure Lua -- no external tools involved beyond however you saved the page.
+-- ---------------------------------------------------------------------------
+
+local SEED_X_MIN, SEED_X_MAX = -47, 80
+
+local function ParseLegendAndTitles(html)
+  local legendTbl = {}
+  for line in html:gmatch("[^\r\n]+") do
+    local hex, comment = line:match('%.C%d+%s*{color:%s*(#%x%x%x%x%x%x);}%s*/%*%s*(.-)%s*%*/')
+    if hex then
+      local symbol, desc = comment:match("^(%S+)%s+(.*)$")
+      if symbol then
+        for i = 1, #symbol do
+          local ch = symbol:sub(i, i)
+          if legendTbl[ch] and legendTbl[ch].desc ~= desc then
+            legendTbl[ch] = { color = hex, desc = legendTbl[ch].desc .. " / " .. desc }
+          else
+            legendTbl[ch] = { color = hex, desc = desc }
+          end
+        end
+      end
+    end
+  end
+
+  local titlesTbl = {}
+  for t in html:gmatch('title="([^"]*)"') do
+    local x, y, tname = t:match("^%((%-?%d+),%s*(%-?%d+)%)%s+(.*)$")
+    if x then
+      titlesTbl[x .. "," .. y] = tname
+    end
+  end
+
+  return legendTbl, titlesTbl
+end
+
+local function ParseSeedGrid(html)
+  local cellsTbl = {}
+  local rowCount = 0
+  local expectedLen = (SEED_X_MAX - SEED_X_MIN + 1) * 2
+
+  for line in html:gmatch("[^\r\n]+") do
+    local yStr, rest = line:match("^%s*(%-?%d+)|(.*)$")
+    if yStr then
+      local content = rest:match("^(.-)|%-?%d+%s*$")
+      if content then
+        local y = tonumber(yStr)
+        local parts = {}
+        for txt in content:gmatch('<span class="C%d+"[^>]*>([^<]*)</span>') do
+          parts[#parts + 1] = txt
+        end
+        local joined = table.concat(parts)
+        if #joined == expectedLen then
+          for col = 0, SEED_X_MAX - SEED_X_MIN do
+            local x = SEED_X_MIN + col
+            local sym = joined:sub(col * 2 + 1, col * 2 + 2)
+            if sym ~= "  " then
+              cellsTbl[x .. "," .. y] = sym
+            end
+          end
+          rowCount = rowCount + 1
+        end
+      end
+    end
+  end
+
+  return cellsTbl, rowCount
+end
+
+local function SortedKeys(t)
+  local keys = {}
+  for k in pairs(t) do keys[#keys + 1] = k end
+  table.sort(keys)
+  return keys
+end
+
+-- ---------------------------------------------------------------------------
+-- New-format import: skrambelled/aa-map's static HTML export (html/map.html
+-- in that repo), a <table id='map'> with one <td class="x{X} y{Y}[ depth{N}]">
+-- per cell containing two <span class="{terrainClass}">{char}</span>. Totally
+-- different shape from the old anguish.org page ParseLegendAndTitles/
+-- ParseSeedGrid above target (row-based lines, numbered "C123" CSS classes,
+-- title="(x, y) name" attributes) -- MapImportSeed picks whichever parser
+-- matches by sniffing for this table's id. This format has NO title data of
+-- its own at all (see MapImportSeed's title-carry-forward for how named
+-- locations survive a re-import from it anyway), but DOES give per-cell
+-- ocean depth, which the old format never had.
+-- ---------------------------------------------------------------------------
+
+-- Colour/description per CSS class name, hand-copied from that repo's
+-- css/map.css -- NOT derived from the saved HTML file itself, since a
+-- plain saved copy of the page won't necessarily carry its stylesheet
+-- along with it, and this handful of terrain colours essentially never
+-- changes. (.sea's colour there is deliberately commented out in that
+-- repo -- depth is what colours sea tiles on the real site -- so the
+-- flat colour below is only used here when the depth-toggle is off.)
+local NEW_FORMAT_LEGEND_BY_CLASS = {
+  beach     = { color = "#808000", desc = "deserts, beach" },
+  lforest   = { color = "#008000", desc = "light forest" },
+  forest    = { color = "#008000", desc = "forest" },
+  thicket   = { color = "#008000", desc = "thicket, bushes" },
+  hill      = { color = "#808000", desc = "hills" },
+  mountain  = { color = "#808000", desc = "mountains" },
+  rocky     = { color = "#800000", desc = "rocky desert" },
+  barren    = { color = "#FF0000", desc = "barren, rugged" },
+  sea       = { color = "#0000FF", desc = "sea, lake" },
+  swamp     = { color = "#008080", desc = "swamp, marsh" },
+  village   = { color = "#FF0000", desc = "fortified village" },
+  building  = { color = "#800080", desc = "settlement / building" },
+  path      = { color = "#800000", desc = "path, sign" },
+  river     = { color = "#008080", desc = "stream, river" },
+  cave      = { color = "#AAAAAA", desc = "dungeon, cave" },
+  open      = { color = "#00FF00", desc = "open-air areas" },
+  grassland = { color = "#008000", desc = "grasslands" },
+  glacier   = { color = "#00FFFF", desc = "icecap, glacier" },
+  bridge    = { color = "#00FFFF", desc = "bridge, ford" },
+  harbour   = { color = "#800000", desc = "harbor, pier" },
+}
+
+local function IsNewFormatPage(html)
+  return html:find("<table id=['\"]map['\"]") ~= nil
+end
+
+-- Returns legendTbl, cellsTbl, depthsTbl, cellCount. Legend is built from
+-- whichever (class, char) pairs actually show up in this file, so an
+-- unrecognized future CSS class just gets skipped (its cells parse fine,
+-- they just render as UNKNOWN_TEXT_COLOUR) rather than erroring out.
+local function ParseNewFormatGrid(html)
+  local legendTbl = {}
+  local cellsTbl = {}
+  local depthsTbl = {}
+  local cellCount = 0
+
+  for classAttr, class1, c1, class2, c2 in
+    html:gmatch('<td class="([^"]*)"><span class="([a-z]+)">(.-)</span><span class="([a-z]+)">(.-)</span></td>')
+  do
+    local x = classAttr:match("x(%-?%d+)")
+    local y = classAttr:match("y(%-?%d+)")
+    if x and y then
+      local key = x .. "," .. y
+      cellsTbl[key] = c1 .. c2
+      local depth = tonumber(classAttr:match("depth(%d+)"))
+      if depth then depthsTbl[key] = depth end
+      if NEW_FORMAT_LEGEND_BY_CLASS[class1] then legendTbl[c1] = NEW_FORMAT_LEGEND_BY_CLASS[class1] end
+      if NEW_FORMAT_LEGEND_BY_CLASS[class2] then legendTbl[c2] = NEW_FORMAT_LEGEND_BY_CLASS[class2] end
+      cellCount = cellCount + 1
+    end
+  end
+
+  return legendTbl, cellsTbl, depthsTbl, cellCount
+end
+
+function MapImportSeed(name, line, wildcards)
+  local path = wildcards[1]
+  local f, err = io.open(path, "r")
+  if not f then
+    ClientNote("could not open " .. path .. ": " .. tostring(err))
+    return
+  end
+  local html = f:read("*a")
+  f:close()
+
+  local legendTbl, cellsTbl, freshTitlesTbl, depthsTbl, rowCount
+  if IsNewFormatPage(html) then
+    legendTbl, cellsTbl, depthsTbl, rowCount = ParseNewFormatGrid(html)
+    freshTitlesTbl = {}
+  else
+    legendTbl, freshTitlesTbl = ParseLegendAndTitles(html)
+    cellsTbl, rowCount = ParseSeedGrid(html)
+    depthsTbl = nil  -- this format has none; keep whatever's already loaded, below
+  end
+
+  if rowCount == 0 then
+    ClientNote("parsed 0 rows out of " .. path .. " -- is this really a saved map page? Aborting, not overwriting seed_data.lua.")
+    return
+  end
+
+  -- Carry a title forward from the CURRENTLY loaded data only where the
+  -- fresh parse didn't already give this coordinate a name (the old
+  -- anguish.org format does; the new skrambelled/aa-map format never
+  -- does) AND the terrain there hasn't changed since (comparing against
+  -- 'cells', the live seed+learned merged view) -- a changed symbol
+  -- means whatever used to be here likely moved or was replaced, so its
+  -- old name shouldn't carry over to whatever's there now.
+  local titlesTbl = {}
+  for k, v in pairs(freshTitlesTbl) do titlesTbl[k] = v end
+  local carriedTitles = 0
+  for k, v in pairs(titles) do
+    if not titlesTbl[k] and cellsTbl[k] == cells[k] then
+      titlesTbl[k] = v
+      carriedTitles = carriedTitles + 1
+    end
+  end
+
+  depthsTbl = depthsTbl or seed_data.depths or {}
+
+  local outPath = PluginDir() .. "seed_data.lua"
+  local out, werr = io.open(outPath, "w")
+  if not out then
+    ClientNote("could not write seed_data.lua: " .. tostring(werr))
+    return
+  end
+
+  out:write("-- Generated by map_import_seed from " .. path .. "\n")
+  out:write("return {\n  legend = {\n")
+  for _, ch in ipairs(SortedKeys(legendTbl)) do
+    out:write(string.format("    [%q] = { color = %q, desc = %q },\n", ch, legendTbl[ch].color, legendTbl[ch].desc))
+  end
+  out:write("  },\n  cells = {\n")
+  local cellKeys = SortedKeys(cellsTbl)
+  for _, k in ipairs(cellKeys) do
+    out:write(string.format("    [%q] = %q,\n", k, cellsTbl[k]))
+  end
+  out:write("  },\n  depths = {\n")
+  local depthKeys = SortedKeys(depthsTbl)
+  for _, k in ipairs(depthKeys) do
+    out:write(string.format("    [%q] = %d,\n", k, depthsTbl[k]))
+  end
+  out:write("  },\n  titles = {\n")
+  local titleKeys = SortedKeys(titlesTbl)
+  for _, k in ipairs(titleKeys) do
+    out:write(string.format("    [%q] = %q,\n", k, titlesTbl[k]))
+  end
+  out:write("  },\n}\n")
+  out:close()
+
+  seed_data = { legend = legendTbl, cells = cellsTbl, titles = titlesTbl, depths = depthsTbl }
+  legend = legendTbl
+  titles = titlesTbl
+  depths = depthsTbl
+  PrecomputeLegendColours(legend)
+  RebuildCells()
+  RedrawMap()
+
+  ClientNote("imported seed data: " .. #SortedKeys(legendTbl) .. " legend chars, " .. rowCount ..
+    " rows, " .. #cellKeys .. " cells, " .. #depthKeys .. " with known depth, " ..
+    #titleKeys .. " named locations (" .. carriedTitles .. " carried forward from before).")
+end
+
+-- ---------------------------------------------------------------------------
+-- Prompt-format auto-detection ("prompt settings" -> regex)
+-- ---------------------------------------------------------------------------
+
+function StartPromptCapture()
+  promptCapture.active = true
+  promptCapture.lines = {}
+  ResetPromptTimer()
+end
+
+function ResetPromptTimer()
+  DeleteTimer("oerthe_prompt_done")
+  -- flags: enabled(1) + one-shot(4) = 5
+  AddTimer("oerthe_prompt_done", 0, 0, 0.4, "", 5, "FinishPromptCapture")
+end
+
+-- Converts one line of the reconstructed |TOKEN| template into a regex.
+local function BuildLineRegex(line)
+  local pattern = "^"
+  local hasX, hasY = false, false
+  local xGroup, yGroup = nil, nil
+  local groupIdx = 0
+  local pos = 1
+  while true do
+    local s, e, token = line:find("|([^|]-)|", pos)
+    if not s then
+      pattern = pattern .. EscapeRegex(line:sub(pos))
+      break
+    end
+    if s > pos then
+      pattern = pattern .. EscapeRegex(line:sub(pos, s - 1))
+    end
+    local ename = token:match("^([^%*]+)")
+    ename = (ename or token):lower()
+
+    if ename == "xcoord" then
+      groupIdx = groupIdx + 1
+      xGroup = groupIdx
+      hasX = true
+      pattern = pattern .. "(-?\\d+)"
+    elseif ename == "ycoord" then
+      groupIdx = groupIdx + 1
+      yGroup = groupIdx
+      hasY = true
+      pattern = pattern .. "(-?\\d+)"
+    elseif ename == "colour" or ename == "color" then
+      -- zero-width: assumes the trigger matches against colour-stripped text
+    elseif ename == "pipe" then
+      pattern = pattern .. "\\|"
+    elseif ename == "space" then
+      pattern = pattern .. " "
+    else
+      pattern = pattern .. ".*?"
+    end
+    pos = e + 1
+  end
+  pattern = pattern .. "$"
+  return { pattern = pattern, hasX = hasX, hasY = hasY, xGroup = xGroup, yGroup = yGroup }
+end
+
+-- The MUD (or the client) hard-wraps long output at a fixed column width,
+-- which can split a |TOKEN| in half across two physical lines -- and it
+-- does this without dropping or adding any characters, so the fix is to
+-- rejoin everything into one continuous string before looking for
+-- |NEWLINE| tokens, rather than trusting physical line boundaries.
+local function SplitOnNewlineToken(text)
+  local logicalLines = {}
+  local pos = 1
+  while true do
+    local s, e = text:find("|NEWLINE|", pos, true)
+    if not s then
+      logicalLines[#logicalLines + 1] = text:sub(pos)
+      break
+    end
+    logicalLines[#logicalLines + 1] = text:sub(pos, s - 1)
+    pos = e + 1
+  end
+  return logicalLines
+end
+
+function FinishPromptCapture()
+  promptCapture.active = false
+  local lines = promptCapture.lines
+
+  if #lines == 0 then
+    ClientNote("got no template lines back from 'prompt settings' -- is a custom prompt active? " ..
+      "(try 'prompt set |HP|:|SP|>|NEWLINE|X:[|XCOORD|]Y:[|YCOORD|]' first)")
+    return
+  end
+
+  local fullText = table.concat(lines, "")
+  local logicalLines = SplitOnNewlineToken(fullText)
+
+  local specs = {}
+  for _, line in ipairs(logicalLines) do
+    local spec = BuildLineRegex(line)
+    if spec.hasX or spec.hasY then
+      specs[#specs + 1] = spec
+    end
+  end
+
+  if #specs == 0 then
+    ClientNote("your prompt template doesn't contain |XCOORD| / |YCOORD|. " ..
+      "Add them with 'prompt set ...' and run map_setup again.")
+    return
+  end
+
+  InstallCoordTriggers(specs)
+  SaveCoordConfig(specs)
+  ClientNote("position tracking configured from " .. #specs .. " prompt line(s). Move around to test it " ..
+    "(map_debug will show the last thing it parsed).")
+end
+
+function OnCoordLineMatch(name, line, wildcards)
+  local spec = coordLineSpecs[name]
+  if not spec then return end
+
+  -- The game resends the prompt (and so this trigger fires) after every
+  -- command/round, not just after moving -- e.g. in combat, or just
+  -- pressing enter. Only redraw when the position actually changed: a
+  -- full redraw deletes and recreates every hotspot, and doing that while
+  -- the mouse is sitting still over one (trying to trigger a tooltip)
+  -- resets MUSHclient's hover timer before it ever fires, which is why
+  -- tooltips could never appear even though click/drag still worked fine.
+  local changed = false
+  if spec.xGroup then
+    local newX = tonumber(wildcards[spec.xGroup])
+    if newX ~= player.x then player.x = newX; changed = true end
+  end
+  if spec.yGroup then
+    local newY = tonumber(wildcards[spec.yGroup])
+    if newY ~= player.y then player.y = newY; changed = true end
+  end
+
+  if changed then
+    RedrawMap()
+  end
+end
+
+-- ---------------------------------------------------------------------------
+-- Live "read map" capture
+-- ---------------------------------------------------------------------------
+
+function OnMapBorderLine()
+  if not mapCapture.active then
+    mapCapture.active = true
+    mapCapture.lines = {}
+  else
+    mapCapture.active = false
+    ParseReadMapBlock(mapCapture.lines)
+  end
+end
+
+function ParseReadMapBlock(lines)
+  if #lines == 0 then return end
+
+  if not player.x or not player.y then
+    ClientNote("read map: your position isn't known yet (run map_setup / check your prompt), skipping.")
+    return
+  end
+
+  local rows = {}
+  local playerRow, playerCol, gridWidth = nil, nil, nil
+
+  for i, raw in ipairs(lines) do
+    local inner = raw:match("^%|%s?(.-)%s?%|$")
+    if not inner then
+      ClientNote("read map: unexpected row format, aborting this block.")
+      return
+    end
+
+    local bpos = inner:find("<", 1, true)
+    if bpos then
+      local prefix = inner:sub(1, bpos - 1)
+      local _, colCount = prefix:gsub("%S+", "")
+      playerRow = i
+      playerCol = colCount
+    end
+
+    local normalized = inner:gsub("[<>]", " ")
+    local tokens = {}
+    for tok in normalized:gmatch("%S+") do
+      tokens[#tokens + 1] = tok
+    end
+
+    if gridWidth and #tokens ~= gridWidth then
+      ClientNote("read map: inconsistent row width, aborting this block.")
+      return
+    end
+    gridWidth = #tokens
+    rows[i] = tokens
+  end
+
+  if not playerRow then
+    ClientNote("read map: couldn't find your '<..>' position marker, skipping.")
+    return
+  end
+
+  local learnedCount = 0
+  for r, tokens in ipairs(rows) do
+    for c, tok in ipairs(tokens) do
+      local x = player.x + ((c - 1) - playerCol)
+      local y = player.y - (r - playerRow)
+      learned_data.cells[x .. "," .. y] = tok
+      learnedCount = learnedCount + 1
+    end
+  end
+
+  lastReadMapDebug = { rows = rows, playerRow = playerRow, playerCol = playerCol, atX = player.x, atY = player.y }
+
+  RebuildCells()
+  SaveLearnedData()
+  RedrawMap()
+  ClientNote("learned " .. learnedCount .. " cells from read map at (" .. player.x .. "," .. player.y .. ").")
+end
+
+-- ---------------------------------------------------------------------------
+-- Line dispatch (buffers whichever capture is active)
+-- ---------------------------------------------------------------------------
+
+local BORDER_LINE_PATTERN = "^%+%-+%+$"
+
+function OnPluginLineReceived(text)
+  if promptCapture.active then
+    -- The header line itself also fires this callback; don't record it.
+    if text ~= "Your prompt:" then
+      table.insert(promptCapture.lines, text)
+      ResetPromptTimer()
+    end
+  end
+
+  -- Don't rely on whether this fires before or after the border trigger
+  -- toggles mapCapture.active for the SAME line -- explicitly exclude
+  -- border-shaped lines from the buffer either way.
+  if mapCapture.active and not text:match(BORDER_LINE_PATTERN) then
+    table.insert(mapCapture.lines, text)
+  end
+
+  return true
+end
+
+-- ---------------------------------------------------------------------------
+-- Miniwindow rendering (via winframe.lua: drag/resize/min/max/border chrome)
+-- ---------------------------------------------------------------------------
+
+local mapWin = nil  -- the winframe instance, created in OnPluginInstall
+
+local function RecomputeViewFromContent(contentW, contentH)
+  VIEW_W = math.max(1, math.floor((contentW - MARGIN * 2) / CELL_W_PX))
+  VIEW_H = math.max(1, math.floor((contentH - MARGIN * 2) / LINE_H_PX))
+end
+
+-- Shared pixel geometry for the zoom/snap control cluster, top-right of the
+-- content area. Used by both DrawControls (paint) and OnMapHotspots (click
+-- targets), so the two can never drift apart.
+local function ControlLayout(contentW)
+  local top = mapWin:contentTop() + MARGIN
+  local btnB = top + ZOOM_BTN_SIZE
+  local plusL = contentW - MARGIN - ZOOM_BTN_SIZE
+  local plusR = plusL + ZOOM_BTN_SIZE
+  local minusR = plusL - CTRL_GAP
+  local minusL = minusR - ZOOM_BTN_SIZE
+  local snapR = minusL - CTRL_GAP
+  local snapL = snapR - SNAP_BTN_W
+  local depthR = snapL - CTRL_GAP
+  local depthL = depthR - DEPTH_BTN_W
+  return {
+    depth = { l = depthL, t = top, r = depthR, b = top + SNAP_BTN_H },
+    snap = { l = snapL, t = top, r = snapR, b = top + SNAP_BTN_H },
+    zoomOut = { l = minusL, t = top, r = minusR, b = btnB },
+    zoomIn = { l = plusL, t = top, r = plusR, b = btnB },
+  }
+end
+
+local function DrawCenteredText(text, rect, colour)
+  local tw = WindowTextWidth(mapWin.win, CTRL_FONT_ID, text, false) or 0
+  local tx = rect.l + math.floor(((rect.r - rect.l) - tw) / 2)
+  local ty = rect.t + math.floor(((rect.b - rect.t) - CTRL_LINE_H_PX) / 2)
+  WindowText(mapWin.win, CTRL_FONT_ID, text, tx, ty, rect.r, rect.b, colour, false)
+end
+
+local function DrawControls(contentW, contentH)
+  local layout = ControlLayout(contentW)
+  local bg = HexToMushColour("#333333")
+  local border = HexToMushColour("#888888")
+  local text = HexToMushColour("#FFFFFF")
+  local snapBg = snapToLocation and HexToMushColour("#2E8B57") or HexToMushColour("#555555")
+  local depthBg = showDepth and HexToMushColour("#2E8B57") or HexToMushColour("#555555")
+
+  for _, btn in ipairs{ { layout.depth, depthBg, "DEPTH" }, { layout.snap, snapBg, "SNAP" }, { layout.zoomOut, bg, "-" }, { layout.zoomIn, bg, "+" } } do
+    local rect, rectBg, label = btn[1], btn[2], btn[3]
+    WindowRectOp(mapWin.win, 2, rect.l, rect.t, rect.r, rect.b, rectBg, 0)
+    WindowRectOp(mapWin.win, 1, rect.l, rect.t, rect.r, rect.b, border, 0)
+    DrawCenteredText(label, rect, text)
+  end
+end
+
+local function DrawGrid(contentW, contentH)
+  local cx, cy = CurrentCenter()
+
+  if cx and cy then
+    local halfW = math.floor(VIEW_W / 2)
+    local halfH = math.floor(VIEW_H / 2)
+
+    for row = 0, VIEW_H - 1 do
+      local y = cy + halfH - row
+      for col = 0, VIEW_W - 1 do
+        local x = cx - halfW + col
+        local key = x .. "," .. y
+        local sym = cells[key]
+        local px = MARGIN + col * CELL_W_PX
+        local py = mapWin:contentTop() + MARGIN + row * LINE_H_PX
+        local isPlayer = (player.x and player.y and x == player.x and y == player.y)
+
+        if isPlayer then
+          WindowRectOp(mapWin.win, 2, px, py, px + SYMBOL_W_PX, py + LINE_H_PX, HIGHLIGHT_BG, 0)
+        end
+
+        if sym and #sym >= 2 then
+          local c1, c2 = sym:sub(1, 1), sym:sub(2, 2)
+          local info1 = legend[c1]
+          local info2 = legend[c2]
+          local colour1 = info1 and info1.rgb or UNKNOWN_TEXT_COLOUR
+          local colour2 = info2 and info2.rgb or UNKNOWN_TEXT_COLOUR
+
+          if showDepth then
+            -- Only "=" (sea) glyphs get recoloured by depth -- matches
+            -- the source site's own behaviour (see DEPTH_COLOUR_HEX
+            -- above), where other terrain (e.g. glaciers) keeps its own
+            -- fixed colour regardless of the depth value under it.
+            local depth = depths[key]
+            if depth then
+              if c1 == "=" then colour1 = DEPTH_COLOURS[depth] or colour1 end
+              if c2 == "=" then colour2 = DEPTH_COLOURS[depth] or colour2 end
+            end
+          end
+
+          if colour1 == colour2 then
+            -- Common case (a repeated character, or two legend entries
+            -- that happen to share a colour): one WindowText call for
+            -- both characters instead of two. GDI call count, not the
+            -- colour math, is what scales badly with visible cell count
+            -- when zoomed out, so halving it here (for however many
+            -- cells hit this branch) directly cuts redraw cost.
+            WindowText(mapWin.win, FONT_ID, c1 .. c2, px, py, px + SYMBOL_W_PX, py + LINE_H_PX, colour1, false)
+          else
+            WindowText(mapWin.win, FONT_ID, c1, px, py, px + CHAR_W_PX, py + LINE_H_PX, colour1, false)
+            WindowText(mapWin.win, FONT_ID, c2, px + CHAR_W_PX, py, px + SYMBOL_W_PX, py + LINE_H_PX, colour2, false)
+          end
+        end
+      end
+    end
+  end
+
+  DrawControls(contentW, contentH)
+end
+
+-- ---------------------------------------------------------------------------
+-- Zoom / pan / snap-to-location
+-- ---------------------------------------------------------------------------
+
+local function ApplyZoom()
+  -- map_zoom_in/map_zoom_out are plain text aliases, reachable even
+  -- without a map window (see RedrawMap's comment on mapWin being nil).
+  if not mapWin then return end
+  FONT_SIZE = ZOOM_SIZES[zoomIndex]
+  WindowFont(mapWin.win, FONT_ID, FONT_NAME, FONT_SIZE, false, false, false, false, 0, 49)
+  local w = WindowFontInfo(mapWin.win, FONT_ID, 6)
+  local h = WindowFontInfo(mapWin.win, FONT_ID, 1)
+  if w and w > 0 then CHAR_W_PX = w end
+  if h and h > 0 then LINE_H_PX = h end
+  SYMBOL_W_PX = CHAR_W_PX * 2
+  CELL_W_PX = SYMBOL_W_PX + CHAR_W_PX
+  RecomputeViewFromContent(mapWin.content_w, mapWin.content_h)
+  SetVariable("zoom_index", tostring(zoomIndex))
+  RedrawMap()
+end
+
+function OnMapZoomInClick(flags, hotspotId)
+  mapWin:bringToFront()
+  if zoomIndex < #ZOOM_SIZES then
+    zoomIndex = zoomIndex + 1
+    ApplyZoom()
+  end
+end
+
+function OnMapZoomOutClick(flags, hotspotId)
+  mapWin:bringToFront()
+  if zoomIndex > 1 then
+    zoomIndex = zoomIndex - 1
+    ApplyZoom()
+  end
+end
+
+-- MUSHclient's WindowScrollwheelHandler callback receives (flags, hotspotId)
+-- where bit 0x100 means the wheel scrolled down/towards you (zoom out);
+-- otherwise it scrolled up/away from you (zoom in). Bit 0x01 is NOT
+-- direction -- it's the Shift modifier key (0x02 Control, 0x04 Alt).
+function OnMapWheelZoom(flags, hotspotId)
+  if bit.band(flags, 0x100) ~= 0 then
+    OnMapZoomOutClick(flags, hotspotId)
+  else
+    OnMapZoomInClick(flags, hotspotId)
+  end
+end
+
+function OnMapSnapToggleClick(flags, hotspotId)
+  mapWin:bringToFront()
+  snapToLocation = not snapToLocation
+  SetVariable("snap_to_location", snapToLocation and "1" or "0")
+  if snapToLocation then
+    view.x, view.y = player.x, player.y
+  end
+  RedrawMap()
+end
+
+function OnMapDepthToggleClick(flags, hotspotId)
+  mapWin:bringToFront()
+  showDepth = not showDepth
+  SetVariable("show_depth", showDepth and "1" or "0")
+  RedrawMap()
+end
+
+function OnMapPanMouseDown(flags, hotspotId)
+  mapWin:bringToFront()
+  local cx, cy = CurrentCenter()
+  if not cx then return end
+  panDragState = {
+    startMouseX = WindowInfo(mapWin.win, 17),
+    startMouseY = WindowInfo(mapWin.win, 18),
+    startCenterX = cx,
+    startCenterY = cy,
+  }
+  mapWin:throttled("pan", PAN_REPAINT_INTERVAL, true)
+end
+
+function OnMapPanDragMove(flags, hotspotId)
+  if not panDragState then return end
+  SetCursor(miniwin.cursor_hand)
+
+  local dx = WindowInfo(mapWin.win, 17) - panDragState.startMouseX
+  local dy = WindowInfo(mapWin.win, 18) - panDragState.startMouseY
+  local newX = math.floor(panDragState.startCenterX - dx / CELL_W_PX + 0.5)
+  local newY = math.floor(panDragState.startCenterY + dy / LINE_H_PX + 0.5)
+
+  if newX ~= view.x or newY ~= view.y or snapToLocation then
+    view.x, view.y = newX, newY
+    if snapToLocation then
+      snapToLocation = false
+      SetVariable("snap_to_location", "0")
+    end
+    -- repaintContent() only, NOT RedrawMap()/mapWin:redraw(): the latter
+    -- rebuilds every hotspot (WindowDeleteAllHotspots), which would delete
+    -- the "oerthe_pan_zoom" hotspot this very drag is tracked on and
+    -- silently end the drag after a single move. Hotspots (tooltip
+    -- positions in particular) catch up once on release, below.
+    --
+    -- view.x/y are always kept current above regardless of throttling,
+    -- so a throttled (skipped) tick here just means the visible repaint
+    -- catches up on the next allowed tick, or at the latest on release.
+    if mapWin:throttled("pan", PAN_REPAINT_INTERVAL) then
+      mapWin:repaintContent()
+    end
+  end
+end
+
+function OnMapPanDragRelease(flags, hotspotId)
+  panDragState = nil
+  RedrawMap()
+end
+
+-- Adds the whole-content drag-to-pan/scroll-to-zoom hotspot, mouseover
+-- tooltips over every visible cell with a known place name (from
+-- seed_data.lua's titles), and the zoom/snap button hotspots. Called by
+-- winframe after it finishes setting up its own drag/resize/button
+-- hotspots, via the on_hotspots hook.
+local function OnMapHotspots(contentW, contentH)
+  local top = mapWin:contentTop()
+  local left, right = PAN_EDGE_INSET, contentW - PAN_EDGE_INSET
+  local bottom = top + contentH - PAN_EDGE_INSET
+
+  if right > left and bottom > top then
+    WindowAddHotspot(mapWin.win, "oerthe_pan_zoom", left, top, right, bottom,
+      "", "", "OnMapPanMouseDown", "", "",
+      "", miniwin.cursor_hand, 0)
+    WindowDragHandler(mapWin.win, "oerthe_pan_zoom", "OnMapPanDragMove", "OnMapPanDragRelease", 0)
+    WindowScrollwheelHandler(mapWin.win, "oerthe_pan_zoom", "OnMapWheelZoom")
+  end
+
+  local cx, cy = CurrentCenter()
+  if cx and cy then
+    local halfW = math.floor(VIEW_W / 2)
+    local halfH = math.floor(VIEW_H / 2)
+
+    for row = 0, VIEW_H - 1 do
+      local y = cy + halfH - row
+      for col = 0, VIEW_W - 1 do
+        local x = cx - halfW + col
+        local name = titles[x .. "," .. y]
+        if name then
+          local px = MARGIN + col * CELL_W_PX
+          local py = top + MARGIN + row * LINE_H_PX
+          local hid = "oerthe_cell_tip_" .. col .. "_" .. row
+          -- Shares the pan/zoom behaviour so hovering a named cell isn't a
+          -- dead zone for dragging or scrolling -- only the tooltip differs.
+          WindowAddHotspot(mapWin.win, hid, px, py, px + SYMBOL_W_PX, py + LINE_H_PX,
+            "", "", "OnMapPanMouseDown", "", "",
+            name, miniwin.cursor_arrow, 0)
+          WindowDragHandler(mapWin.win, hid, "OnMapPanDragMove", "OnMapPanDragRelease", 0)
+          WindowScrollwheelHandler(mapWin.win, hid, "OnMapWheelZoom")
+        end
+      end
+    end
+  end
+
+  local layout = ControlLayout(contentW)
+  WindowAddHotspot(mapWin.win, "oerthe_btn_depth", layout.depth.l, layout.depth.t, layout.depth.r, layout.depth.b,
+    "", "", "OnMapDepthToggleClick", "", "", "Toggle ocean depth colours", miniwin.cursor_hand, 0)
+  WindowAddHotspot(mapWin.win, "oerthe_btn_snap", layout.snap.l, layout.snap.t, layout.snap.r, layout.snap.b,
+    "", "", "OnMapSnapToggleClick", "", "", "Toggle snap-to-location", miniwin.cursor_hand, 0)
+  WindowAddHotspot(mapWin.win, "oerthe_btn_zoom_out", layout.zoomOut.l, layout.zoomOut.t, layout.zoomOut.r, layout.zoomOut.b,
+    "", "", "OnMapZoomOutClick", "", "", "Zoom out", miniwin.cursor_hand, 0)
+  WindowAddHotspot(mapWin.win, "oerthe_btn_zoom_in", layout.zoomIn.l, layout.zoomIn.t, layout.zoomIn.r, layout.zoomIn.b,
+    "", "", "OnMapZoomInClick", "", "", "Zoom in", miniwin.cursor_hand, 0)
+end
+
+local function InitWindow()
+  -- A throwaway probe window just to measure the grid font's metrics
+  -- before winframe.new() needs pixel-based min-size constraints.
+  local PROBE = "oerthe_font_probe"
+  WindowCreate(PROBE, 0, 0, 1, 1, 6, 0, 0)
+  WindowFont(PROBE, FONT_ID, FONT_NAME, FONT_SIZE, false, false, false, false, 0, 49)
+  CHAR_W_PX = WindowFontInfo(PROBE, FONT_ID, 6)
+  LINE_H_PX = WindowFontInfo(PROBE, FONT_ID, 1)
+  if not CHAR_W_PX or CHAR_W_PX <= 0 then CHAR_W_PX = 8 end
+  if not LINE_H_PX or LINE_H_PX <= 0 then LINE_H_PX = 14 end
+  SYMBOL_W_PX = CHAR_W_PX * 2
+  CELL_W_PX = SYMBOL_W_PX + CHAR_W_PX   -- symbol plus a single-space gap
+  WindowDelete(PROBE)
+
+  local winframe = assert(loadfile(DirOf(WINDOWS_PLUGIN_ID) .. "winframe.lua"))()
+
+  mapWin = winframe.new{
+    id = "oerthe_map",
+    title = "Oerthe Map",
+    bg_colour = BG_COLOUR,
+    min_content_w = MARGIN * 2 + MIN_VIEW * CELL_W_PX,
+    min_content_h = MARGIN * 2 + MIN_VIEW * LINE_H_PX,
+    default_content_w = MARGIN * 2 + VIEW_W * CELL_W_PX,
+    default_content_h = MARGIN * 2 + VIEW_H * LINE_H_PX,
+    on_resize = RecomputeViewFromContent,
+    on_draw = DrawGrid,
+    preview_label = function(w, h)
+      local vw = math.max(1, math.floor((w - MARGIN * 2) / CELL_W_PX))
+      local vh = math.max(1, math.floor((h - MARGIN * 2) / LINE_H_PX))
+      return vw .. " x " .. vh
+    end,
+    on_hotspots = OnMapHotspots,
+  }
+
+  WindowFont(mapWin.win, FONT_ID, FONT_NAME, FONT_SIZE, false, false, false, false, 0, 49)
+
+  WindowFont(mapWin.win, CTRL_FONT_ID, FONT_NAME, CTRL_FONT_SIZE, true, false, false, false, 0, 49)
+  local ctrlLineH = WindowFontInfo(mapWin.win, CTRL_FONT_ID, 1)
+  if ctrlLineH and ctrlLineH > 0 then CTRL_LINE_H_PX = ctrlLineH end
+end
+
+function RedrawMap()
+  -- mapWin is nil when EnsureWindowsPlugin() failed at install time (the
+  -- 'mush_windows' plugin wasn't available) -- position tracking and text
+  -- commands still run in that mode, and they route redraw requests
+  -- through here same as ever, so this just needs to be a no-op rather
+  -- than a crash.
+  if not mapWin then return end
+  mapWin:redraw()
+end
+
+-- ---------------------------------------------------------------------------
+-- Commands (aliases)
+-- ---------------------------------------------------------------------------
+
+function MapSetup()
+  ClientNote("requesting your prompt format...")
+  Send("prompt settings")
+end
+
+function MapRefresh()
+  Send(readMapCommand)
+end
+
+function MapSetCmd(name, line, wildcards)
+  readMapCommand = wildcards[1]
+  SetVariable("read_map_command", readMapCommand)
+  ClientNote("map_refresh will now send: " .. readMapCommand)
+end
+
+function MapHideCoords()
+  SetHideCoordLine(true)
+end
+
+function MapShowCoords()
+  SetHideCoordLine(false)
+end
+
+function MapLegend()
+  ClientNote("terrain legend:")
+  local chars = {}
+  for ch in pairs(legend) do chars[#chars + 1] = ch end
+  table.sort(chars)
+  for _, ch in ipairs(chars) do
+    local info = legend[ch]
+    ColourNote(info.rgb, "", "  " .. ch .. "  " .. info.desc)
+  end
+end
+
+function MapShow()
+  if not mapWin then
+    ClientNote("no map window -- install the 'mush_windows' plugin, then reload this plugin.")
+    return
+  end
+  mapWin:show()
+end
+
+function MapHide()
+  if mapWin then mapWin:hide() end
+end
+
+function MapZoomIn()
+  OnMapZoomInClick(0, "")
+end
+
+function MapZoomOut()
+  OnMapZoomOutClick(0, "")
+end
+
+function MapToggleSnap()
+  OnMapSnapToggleClick(0, "")
+  ClientNote(snapToLocation and "now snapped to your current location." or "no longer snapped -- drag the map, or map_snap to re-lock.")
+end
+
+function MapDebug()
+  if not lastReadMapDebug then
+    ClientNote("no read map block parsed yet this session.")
+    return
+  end
+  local d = lastReadMapDebug
+  ClientNote("last read map parsed at (" .. d.atX .. "," .. d.atY .. "), marker at row " ..
+    d.playerRow .. " col " .. d.playerCol .. " (0-based):")
+  for r, tokens in ipairs(d.rows) do
+    ClientNote("  row " .. r .. ": " .. table.concat(tokens, " "))
+  end
+end
+
+-- ---------------------------------------------------------------------------
+-- Lifecycle
+-- ---------------------------------------------------------------------------
+
+function OnPluginInstall()
+  local saved = GetVariable("read_map_command")
+  if saved and saved ~= "" then readMapCommand = saved end
+  local savedHide = GetVariable("hide_coord_line")
+  if savedHide == nil then
+    hideCoordLine = true  -- default on for a fresh install; explicit map_show_coords overrides
+  else
+    hideCoordLine = savedHide == "1"
+  end
+
+  local savedZoom = tonumber(GetVariable("zoom_index"))
+  if savedZoom and ZOOM_SIZES[savedZoom] then zoomIndex = savedZoom end
+  local savedSnap = GetVariable("snap_to_location")
+  if savedSnap ~= nil then snapToLocation = savedSnap == "1" end
+  local savedShowDepth = GetVariable("show_depth")
+  if savedShowDepth ~= nil then showDepth = savedShowDepth == "1" end
+
+  LoadData()
+
+  if EnsureWindowsPlugin() then
+    InitWindow()
+    ApplyZoom()
+  else
+    ClientNote("continuing without the map window -- position tracking and text commands " ..
+      "(map_legend, etc.) still work.")
+  end
+
+  if not LoadCoordConfig() then
+    ClientNote("not set up yet -- make sure your prompt includes |XCOORD| and |YCOORD| " ..
+      "(see 'help prompt'), then type: map_setup")
+  end
+end
+
+]]>
+</script>
+
+</muclient>
